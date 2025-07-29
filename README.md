@@ -1,4 +1,6 @@
 # PowerBI_Coffee_Sales_Dashboard
+Refer to this link for Video Explanation: https://www.loom.com/share/a50775e173734e159f3415f01bfa2eab?sid=8d02b398-3dfb-438f-9b61-4edbb494e890
+
 OBJECTIVE:
 The objective of creating this dashboard is to analyze the coffee shop's sales performance over a period of 6 months.
 I have broken down the objective by analyzing sales on an hourly basis, by store location, by product category, and by weekend vs. weekday sales.
