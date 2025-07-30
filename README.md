@@ -3,7 +3,7 @@ Refer to this link for Video Explanation (Usage of headphones will provide prope
  
 
 
- https://www.loom.com/share/a50775e173734e159f3415f01bfa2eab?sid=8d02b398-3dfb-438f-9b61-4edbb494e890
+ https://www.loom.com/share/a50775e173734e159f3415f01bfa2eab?sid=b14be123-cbd9-4852-9e9a-b5cf1559aa0a
 
 OBJECTIVE:
 The objective of creating this dashboard is to analyze the coffee shop's sales performance over a period of 6 months.
