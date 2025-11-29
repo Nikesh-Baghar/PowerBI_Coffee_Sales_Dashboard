@@ -7,9 +7,19 @@ Original file is located at
     https://colab.research.google.com/drive/1qYjbc2mJe0KL0yJYuqq5Twfas61crZwm
 """
 
+# streamlit_app.py
+
 import streamlit as st
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+
+from datasets import load_dataset
+import evaluate
+
+# -----------------------------------
+# Requirements (install these):
+#   pip install streamlit transformers datasets evaluate mauve-text sacrebleu
+# -----------------------------------
 
 # -----------------------------
 # Model Configurations
@@ -17,11 +27,12 @@ import torch
 MODELS = {
     "GPT-Neo (125M)": "EleutherAI/gpt-neo-125M",
     "GPT-2": "openai-community/gpt2",
-    "Qwen-0.6B": "Qwen/Qwen3-0.6B"
+    "Qwen-0.6B": "Qwen/Qwen3-0.6B",
 }
 
+
 # -----------------------------
-# Load model and tokenizer
+# Cached helpers: models, datasets, metrics
 # -----------------------------
 @st.cache_resource
 def load_model(model_name):
@@ -29,21 +40,99 @@ def load_model(model_name):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype="auto",
-        device_map="auto"
+        device_map="auto",
     )
     return tokenizer, model
+
+
+@st.cache_resource
+def load_wmt14_de_en():
+    # WMT14 de-en configuration
+    return load_dataset("wmt/wmt14", "de-en")
+
+
+@st.cache_resource
+def load_cnn_dailymail():
+    return load_dataset("cnn_dailymail", "3.0.0")
+
+
+@st.cache_resource
+def load_writingprompts():
+    # Has columns: "prompt", "story"
+    return load_dataset("euclaise/writingprompts")
+
+
+@st.cache_resource
+def load_metric_cached(name):
+    return evaluate.load(name)
+
+
+# -----------------------------
+# Prepare 5 prompt options per task
+# -----------------------------
+@st.cache_resource
+def get_prompt_options(task, translation_dir=None, n=5):
+    """
+    Returns a list of dicts with keys:
+      - 'source': text given to the model as prompt content
+      - 'reference': gold-standard reference output
+    For each task, we simply take the first `n` examples from the test split.
+    """
+
+    options = []
+
+    if task == "Machine Translation":
+        ds = load_wmt14_de_en()
+        split = ds["test"]
+        src_lang, tgt_lang = (
+            ("en", "de") if translation_dir == "English → German" else ("de", "en")
+        )
+
+        for i in range(min(n, len(split))):
+            row = split[i]
+            src = row["translation"][src_lang]
+            tgt = row["translation"][tgt_lang]
+            options.append({"source": src, "reference": tgt})
+
+    elif task == "Summarization":
+        ds = load_cnn_dailymail()
+        split = ds["test"]
+        for i in range(min(n, len(split))):
+            row = split[i]
+            article = row["article"]
+            summary = row["highlights"]
+            options.append({"source": article, "reference": summary})
+
+    elif task == "Story Generation":
+        ds = load_writingprompts()
+        split = ds["test"]
+        for i in range(min(n, len(split))):
+            row = split[i]
+            prompt = row["prompt"]
+            story = row["story"]
+            options.append({"source": prompt, "reference": story})
+
+    return options
 
 
 # -----------------------------
 # Generation Function
 # -----------------------------
-def generate_response(tokenizer, model, prompt, strategy="greedy",
-                      temperature=0.7, top_k=20, top_p=0.85, max_new_tokens=800):
+def generate_response(
+    tokenizer,
+    model,
+    prompt,
+    strategy="greedy",
+    temperature=0.7,
+    top_k=20,
+    top_p=0.85,
+    max_new_tokens=800,
+):
 
     gen_kwargs = {
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
-        "do_sample": True  # Enabled for most sampling-based decoding
+        "do_sample": True,
     }
 
     # --- Decoding Strategies ---
@@ -56,43 +145,79 @@ def generate_response(tokenizer, model, prompt, strategy="greedy",
     elif strategy == "top-p":
         gen_kwargs.update({"top_p": top_p})
     elif strategy == "contrastive-search":
-        # Contrastive search (a.k.a. contrastive decoding)
         gen_kwargs.update({"penalty_alpha": 0.6, "top_k": 4})
     elif strategy == "locally-typical":
-        # Locally typical sampling
         gen_kwargs.update({"typical_p": 0.9})
     elif strategy == "speculative-decoding":
-        # Simulate speculative decoding with fast sampling
         gen_kwargs.update({"top_p": 0.8, "temperature": 0.6, "top_k": 30})
     elif strategy == "contrastive-divergence":
-        # Approximation: stronger penalty for repetition
-        gen_kwargs.update({"repetition_penalty": 1.8, "top_k": 40, "temperature": 0.7})
+        gen_kwargs.update(
+            {"repetition_penalty": 1.8, "top_k": 40, "temperature": 0.7}
+        )
     else:
         raise ValueError("Unsupported decoding strategy")
 
-    # Handle chat models like Qwen
+    # --- Prepare inputs robustly ---
     if "Qwen" in model.name_or_path and hasattr(tokenizer, "apply_chat_template"):
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
-        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        text_to_tokenize = text
     else:
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        text_to_tokenize = prompt
 
-    # Generate
+    model_max_len = getattr(tokenizer, "model_max_length", None)
+    if model_max_len is None:
+        model_max_len = getattr(model.config, "max_position_embeddings", None)
+
+    inputs = tokenizer(
+        text_to_tokenize,
+        return_tensors="pt",
+        truncation=False,
+        padding=False,
+    ).to(model.device)
+
+    input_len = inputs.input_ids.shape[1]
+
+    if model_max_len is not None and input_len >= model_max_len:
+        st.warning(
+            f"Prompt too long for model context "
+            f"({input_len} tokens > {model_max_len}). Truncating to last {model_max_len - 1} tokens."
+        )
+        all_ids = inputs.input_ids[0]
+        keep = model_max_len - 1
+        new_ids = all_ids[-keep:].unsqueeze(0).to(model.device)
+        inputs["input_ids"] = new_ids
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"]).to(
+            model.device
+        )
+        input_len = inputs.input_ids.shape[1]
+
+    if model_max_len is not None:
+        max_allowed = min(model_max_len, input_len + max_new_tokens)
+    else:
+        max_allowed = input_len + max_new_tokens
+
+    gen_kwargs.update({"max_length": max_allowed, "max_new_tokens": max_new_tokens})
+
     with torch.no_grad():
         outputs = model.generate(**inputs, **gen_kwargs)
-    result = tokenizer.decode(outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True)
+
+    generated_ids = outputs[0][input_len:]
+    result = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return result.strip()
 
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.title("🧠 LLM Response Comparator")
+st.title("🧠 LLM Response Comparator with Benchmark Evaluation")
 
-# User selections
+# Model & decoding selections
 model_choice = st.selectbox("Select a model:", list(MODELS.keys()))
 
 strategy = st.selectbox(
@@ -105,23 +230,130 @@ strategy = st.selectbox(
         "contrastive-search",
         "locally-typical",
         "speculative-decoding",
-        "contrastive-divergence"
-    ]
+        "contrastive-divergence",
+    ],
 )
 
-prompt = st.text_area("Enter your prompt:", "Write a 500-word essay on the future of AI.")
+# Task Selection
+task = st.selectbox(
+    "Select a task:",
+    ["Machine Translation", "Summarization", "Story Generation"],
+)
 
+translation_dir = None
+if task == "Machine Translation":
+    translation_dir = st.selectbox(
+        "Select translation direction:",
+        ["English → German", "German → English"],
+    )
+
+# -----------------------------
+# Load 5 benchmark options
+# -----------------------------
+if task == "Machine Translation":
+    options = get_prompt_options(task, translation_dir=translation_dir, n=5)
+else:
+    options = get_prompt_options(task, translation_dir=None, n=5)
+
+if not options:
+    st.error("No benchmark examples loaded. Please check dataset availability.")
+    st.stop()
+
+# Create labels for dropdown (short preview)
+def make_label(idx, text):
+    preview = text.replace("\n", " ")
+    if len(preview) > 120:
+        preview = preview[:120] + "..."
+    return f"Example {idx + 1}: {preview}"
+
+
+option_indices = list(range(len(options)))
+option_labels = [make_label(i, options[i]["source"]) for i in option_indices]
+
+selected_idx = st.selectbox(
+    "Choose a benchmark example to use as prompt:", option_indices, format_func=lambda i: option_labels[i]
+)
+
+selected_example = options[selected_idx]
+dataset_source_text = selected_example["source"]
+reference_text = selected_example["reference"]
+
+# -----------------------------
+# Generation Settings
+# -----------------------------
 temperature = st.slider("Temperature", 0.0, 2.0, 1.0, 0.1)
 max_new_tokens = st.slider("Max New Tokens", 50, 800, 500, 50)
 
-if st.button("Generate"):
+# -----------------------------
+# Generate Button
+# -----------------------------
+if st.button("Generate and Evaluate"):
     tokenizer, model = load_model(MODELS[model_choice])
+
+    # 1. Build final prompt for the model
+    if task == "Machine Translation":
+        src_lang_name = "English" if translation_dir == "English → German" else "German"
+        tgt_lang_name = "German" if translation_dir == "English → German" else "English"
+        final_prompt = (
+            f"Translate the following text from {src_lang_name} to {tgt_lang_name}:\n"
+            f"{dataset_source_text}"
+        )
+        metric_to_use = "sacrebleu"
+    elif task == "Summarization":
+        final_prompt = f"Summarize the following text in about 80 words:\n{dataset_source_text}"
+        metric_to_use = "rouge"
+    else:  # Story Generation
+        final_prompt = f"Continue the following story creatively:\n{dataset_source_text}"
+        metric_to_use = "mauve"
+
+    # 2. Show benchmark input
+    st.subheader("Benchmark Input (Prompt to the LLM)")
+    st.write(dataset_source_text)
+
+    # 3. Generate response
     with st.spinner("Generating response..."):
         response = generate_response(
-            tokenizer, model, prompt,
+            tokenizer,
+            model,
+            final_prompt,
             strategy=strategy,
             temperature=temperature,
-            max_new_tokens=max_new_tokens
+            max_new_tokens=max_new_tokens,
         )
+
     st.subheader("Generated Response")
     st.write(response)
+
+    # 4. Show reference text
+    st.subheader("Reference Text (Gold Standard from Dataset)")
+    st.write(reference_text)
+
+    # 5. Compute and display metric
+    st.subheader("Evaluation Metrics")
+
+    if metric_to_use == "sacrebleu":
+        bleu_metric = load_metric_cached("sacrebleu")
+        result = bleu_metric.compute(
+            predictions=[response],
+            references=[[reference_text]],
+        )
+        st.markdown("**Metric:** BLEU (via SacreBLEU on WMT14)")
+        st.write({"bleu_score": result["score"], "precisions": result["precisions"]})
+
+    elif metric_to_use == "rouge":
+        rouge_metric = load_metric_cached("rouge")
+        result = rouge_metric.compute(
+            predictions=[response],
+            references=[reference_text],
+        )
+        st.markdown("**Metric:** ROUGE (CNN/DailyMail)")
+        st.write(result)
+
+    elif metric_to_use == "mauve":
+        mauve_metric = load_metric_cached("mauve")
+        result = mauve_metric.compute(
+            predictions=[response],
+            references=[reference_text],
+        )
+        st.markdown("**Metric:** MAUVE (WritingPrompts)")
+        st.write(result)  # typically {'mauve': value} or similar
