@@ -4,3 +4,7 @@ accelerate
 torch
 torchvision
 torchaudio
+datasets
+evaluate
+sacrebleu
+mauve-text
